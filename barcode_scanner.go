@@ -11,8 +11,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -27,9 +30,26 @@ import (
 	"github.com/unidoc/unipdf/v3/model"
 )
 
-type BarcodeInfo struct {
-	Pages []int
+// ──────────────────────────────── helpers ────────────────────────────────
+
+type BarcodeInfo struct{ Pages []int }
+
+func sanitize(s string) string { // нормализуем код для сравнения
+	s = strings.TrimSpace(s)
+	return strings.Map(func(r rune) rune {
+		if r < 32 { // управляющие удалить
+			return -1
+		}
+		return unicode.ToUpper(r)
+	}, s)
 }
+
+// runOnUI выполняет fn в главном UI‑потоке Fyne.
+func runOnUI(fn func()) {
+	fyne.Do(fn)
+}
+
+// ───────────────────────────── GUI ─────────────────────────────
 
 var (
 	progressBar  *widget.ProgressBar
@@ -41,53 +61,40 @@ var (
 func main() {
 	a := app.New()
 	w := a.NewWindow("Сканер штрихкодов PDF")
-	w.Resize(fyne.NewSize(800, 600))
+	w.Resize(fyne.NewSize(820, 640))
 
+	// поля ввода
 	pdfPathEntry := widget.NewEntry()
-	pdfPathEntry.SetPlaceHolder("Путь к PDF-файлу")
+	pdfPathEntry.SetPlaceHolder("Путь к PDF‑файлу")
 
-	selectFileButton := widget.NewButton("Выбрать файл PDF", func() {
-		fileDialog := dialog.NewFileOpen(func(closer fyne.URIReadCloser, err error) {
+	chooseBtn := widget.NewButton("Выбрать…", func() {
+		fd := dialog.NewFileOpen(func(f fyne.URIReadCloser, err error) {
 			if err != nil {
 				dialog.ShowError(err, w)
 				return
 			}
-			if closer == nil {
+			if f == nil {
 				return
 			}
-			pdfPathEntry.SetText(closer.URI().Path())
+			pdfPathEntry.SetText(f.URI().Path())
 		}, w)
-
-		// Установим размер окна проводника
-		fileDialog.Resize(fyne.NewSize(800, 500))
-
-		fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".pdf"}))
-		fileDialog.Show()
+		fd.Resize(fyne.NewSize(800, 500))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".pdf"}))
+		fd.Show()
 	})
 
 	dpiEntry := widget.NewEntry()
-	dpiEntry.SetText("200")
-	dpiEntry.SetPlaceHolder("DPI (например, 200)")
-
+	dpiEntry.SetText("160")
 	delayEntry := widget.NewEntry()
-	delayEntry.SetText("150")
-	delayEntry.SetPlaceHolder("Задержка (мс)")
+	delayEntry.SetText("100")
+	concEntry := widget.NewEntry()
+	concEntry.SetText(strconv.Itoa(runtime.NumCPU()))
 
-	maxConcurrentEntry := widget.NewEntry()
-	maxConcurrentEntry.SetText(strconv.Itoa(runtime.NumCPU() * 2))
-	maxConcurrentEntry.SetPlaceHolder("Макс. параллельных операций")
+	// спискок поддерживаемых форматов
+	formats := []string{"AZTEC", "CODABAR", "CODE_39", "CODE_93", "CODE_128", "DATA_MATRIX", "EAN_8", "EAN_13", "ITF", "MAXICODE", "PDF_417", "QR_CODE", "RSS_14", "RSS_EXPANDED", "UPC_A", "UPC_E", "UPC_EAN_EXTENSION"}
+	selFmt := map[gozxing.BarcodeFormat]bool{}
 
-	// Перечисление всех возможных форматов, которые gozxing может распознавать
-	barcodeFormats := []string{
-		"AZTEC", "CODABAR", "CODE_39", "CODE_93", "CODE_128", "DATA_MATRIX",
-		"EAN_8", "EAN_13", "ITF", "MAXICODE", "PDF_417", "QR_CODE",
-		"RSS_14", "RSS_EXPANDED", "UPC_A", "UPC_E", "UPC_EAN_EXTENSION",
-	}
-
-	selectedFormatsMap := make(map[gozxing.BarcodeFormat]bool)
-
-	// Вспомогательная функция для конвертации строки в gozxing.BarcodeFormat
-	stringToBarcodeFormat := func(s string) (gozxing.BarcodeFormat, bool) {
+	toFmt := func(s string) (gozxing.BarcodeFormat, bool) {
 		switch s {
 		case "AZTEC":
 			return gozxing.BarcodeFormat_AZTEC, true
@@ -123,33 +130,30 @@ func main() {
 			return gozxing.BarcodeFormat_UPC_E, true
 		case "UPC_EAN_EXTENSION":
 			return gozxing.BarcodeFormat_UPC_EAN_EXTENSION, true
-		default:
-			return gozxing.BarcodeFormat(0), false
+		}
+		return 0, false
+	}
+
+	initFmt := []string{"CODE_128", "QR_CODE"}
+	for _, s := range initFmt {
+		if f, ok := toFmt(s); ok {
+			selFmt[f] = true
 		}
 	}
 
-	// Установка значений по умолчанию (например, только CODE_128 и QR_CODE)
-	initialSelectedStrings := []string{"CODE_128", "QR_CODE"}
-	for _, s := range initialSelectedStrings {
-		if format, ok := stringToBarcodeFormat(s); ok {
-			selectedFormatsMap[format] = true
+	check := widget.NewCheckGroup(formats, func(selected []string) {
+		for k := range selFmt {
+			delete(selFmt, k)
 		}
-	}
-
-	barcodeFormatCheckGroup := widget.NewCheckGroup(barcodeFormats, func(selected []string) {
-		// Очищаем предыдущие выборы
-		for k := range selectedFormatsMap {
-			delete(selectedFormatsMap, k)
-		}
-		// Обновляем на основе новых выборов
-		for _, formatStr := range selected {
-			if format, ok := stringToBarcodeFormat(formatStr); ok {
-				selectedFormatsMap[format] = true
+		for _, s := range selected {
+			if f, ok := toFmt(s); ok {
+				selFmt[f] = true
 			}
 		}
 	})
-	barcodeFormatCheckGroup.SetSelected(initialSelectedStrings)
+	check.SetSelected(initFmt)
 
+	// элементы состояния
 	progressBar = widget.NewProgressBar()
 	statusLabel = widget.NewLabel("Ожидание файла PDF...")
 	resultsEntry = widget.NewMultiLineEntry()
@@ -158,328 +162,220 @@ func main() {
 	resultsEntry.SetPlaceHolder("Результаты сканирования...")
 	resultsEntry.Wrapping = fyne.TextWrapBreak
 
-	scanButton = widget.NewButton("Начать сканирование", func() {
+	// кнопка Сканировать
+	scanButton = widget.NewButton("Сканировать", func() {
 		pdfPath := pdfPathEntry.Text
 		if pdfPath == "" {
 			statusLabel.SetText("Ошибка: Пожалуйста, выберите файл PDF.")
 			return
 		}
-
 		dpi, err := strconv.Atoi(dpiEntry.Text)
 		if err != nil || dpi <= 0 {
-			statusLabel.SetText("Ошибка: Неверное значение DPI.")
+			statusLabel.SetText("Некорректный DPI")
 			return
 		}
-
 		delay, err := strconv.Atoi(delayEntry.Text)
 		if err != nil || delay < 0 {
-			statusLabel.SetText("Ошибка: Неверное значение задержки.")
+			statusLabel.SetText("Некорректная задержка")
 			return
 		}
-
-		conc, err := strconv.Atoi(maxConcurrentEntry.Text)
+		conc, err := strconv.Atoi(concEntry.Text)
 		if err != nil || conc <= 0 {
-			statusLabel.SetText("Ошибка: Неверное значение макс. параллельных операций.")
+			statusLabel.SetText("Некорректный параллелизм")
 			return
 		}
-
-		// Конвертируем map selectedFormatsMap в срез для сканера
-		formatsToScan := []gozxing.BarcodeFormat{}
-		for format, isSelected := range selectedFormatsMap {
-			if isSelected {
-				formatsToScan = append(formatsToScan, format)
-			}
+		var fmts []gozxing.BarcodeFormat
+		for f := range selFmt {
+			fmts = append(fmts, f)
 		}
-		if len(formatsToScan) == 0 {
-			statusLabel.SetText("Ошибка: Пожалуйста, выберите хотя бы один формат штрихкода.")
+		if len(fmts) == 0 {
+			statusLabel.SetText("Выберите формат")
 			return
 		}
 
 		scanButton.Disable()
 		progressBar.SetValue(0)
 		resultsEntry.SetText("")
-		statusLabel.SetText("Сканирование начато...")
+		statusLabel.SetText("Сканирование…")
 
-		// Запускаем сканирование в отдельной горутине, чтобы не блокировать GUI
 		go func() {
-			scanPDF(pdfPath, dpi, time.Duration(delay)*time.Millisecond, formatsToScan, conc)
-			scanButton.Enable()
+			scanPDF(pdfPathEntry.Text, dpi, time.Duration(delay)*time.Millisecond, fmts, conc)
+			runOnUI(scanButton.Enable)
 		}()
 	})
 
-	inputForm := container.New(layout.NewFormLayout(),
-		widget.NewLabel("Путь к PDF:"), pdfPathEntry,
-		widget.NewLabel(""), selectFileButton, // Empty label to align button
+	// раскладка
+	form := container.New(layout.NewFormLayout(),
+		widget.NewLabel("PDF:"), pdfPathEntry,
+		widget.NewLabel(""), chooseBtn,
 		widget.NewLabel("DPI:"), dpiEntry,
 		widget.NewLabel("Задержка (мс):"), delayEntry,
-		widget.NewLabel("Макс. параллельных операций:"), maxConcurrentEntry,
+		widget.NewLabel("Потоков:"), concEntry,
 	)
+	scrollableBarcodeFormats := container.NewVScroll(check)
 
-	// Оборачиваем CheckGroup в NewVScroll для адаптивной высоты
-	scrollableBarcodeFormats := container.NewVScroll(barcodeFormatCheckGroup)
-	// Fyne автоматически скорректирует высоту при добавлении содержимого.
-	scrollableBarcodeFormats.SetMinSize(fyne.NewSize(0, 200))
-	content := container.New(layout.NewVBoxLayout(),
-		inputForm,
-		widget.NewLabel("Форматы штрихкодов:"),
-		scrollableBarcodeFormats,
+	scrollableBarcodeFormats.SetMinSize(fyne.NewSize(0, 250))
+	ui := container.New(layout.NewVBoxLayout(),
+		form,
+		widget.NewLabel("Форматы:"), scrollableBarcodeFormats,
 		widget.NewSeparator(),
-		scanButton,
-		progressBar,
-		statusLabel,
-		widget.NewSeparator(),
-		resultsEntry,
+		scanButton, progressBar, statusLabel, widget.NewSeparator(), resultsEntry,
 	)
-
-	w.SetContent(content)
+	w.SetContent(ui)
 	w.ShowAndRun()
 }
 
-// scanPDF contains the core logic for PDF processing and barcode scanning
-func scanPDF(pdfPath string, dpi int, delay time.Duration, formatsToScan []gozxing.BarcodeFormat, maxConcurrent int) {
-	// Обработчик panic, чтобы предотвратить крах GUI при непредвиденных ошибках
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Recovered from panic in scanPDF: %v", r)
-			fyne.CurrentApp().SendNotification(&fyne.Notification{
-				Title:   "Ошибка сканирования",
-				Content: fmt.Sprintf("Произошла неожиданная ошибка: %v. Проверьте логи.", r),
-			})
-			statusLabel.SetText("Произошла неожиданная ошибка.")
-		}
-		scanButton.Enable()
-	}()
+// ─────────────────────────── core ────────────────────────────
 
+func scanPDF(pdfPath string, dpi int, delay time.Duration, fmts []gozxing.BarcodeFormat, conc int) {
+	startTime := time.Now()
 	file, err := os.Open(pdfPath)
 	if err != nil {
-		fyne.CurrentApp().SendNotification(&fyne.Notification{
-			Title:   "Ошибка файла",
-			Content: fmt.Sprintf("Ошибка открытия PDF-файла: %v", err),
-		})
-		statusLabel.SetText(fmt.Sprintf("Ошибка: %v", err))
+		runOnUI(func() { statusLabel.SetText(fmt.Sprintf("Ошибка открытия: %v", err)) })
 		return
 	}
 	defer file.Close()
 
-	// Используем импортированный "model" из unipdf/v3/model
-	pdfReader, err := model.NewPdfReader(file)
+	reader, err := model.NewPdfReader(file)
 	if err != nil {
-		fyne.CurrentApp().SendNotification(&fyne.Notification{
-			Title:   "Ошибка PDF",
-			Content: fmt.Sprintf("Ошибка чтения PDF-файла: %v", err),
-		})
-		statusLabel.SetText(fmt.Sprintf("Ошибка: %v", err))
+		runOnUI(func() { statusLabel.SetText(fmt.Sprintf("Ошибка чтения PDF: %v", err)) })
+		return
+	}
+	numPages, err := reader.GetNumPages()
+	if err != nil {
+		runOnUI(func() { statusLabel.SetText(fmt.Sprintf("Ошибка страниц: %v", err)) })
 		return
 	}
 
-	numPages, err := pdfReader.GetNumPages()
-	if err != nil {
-		fyne.CurrentApp().SendNotification(&fyne.Notification{
-			Title:   "Ошибка PDF",
-			Content: fmt.Sprintf("Ошибка получения количества страниц: %v", err),
-		})
-		statusLabel.SetText(fmt.Sprintf("Ошибка: %v", err))
-		return
+	// ограничить параллелизм максимумом ядер
+	if conc > runtime.NumCPU() {
+		conc = runtime.NumCPU()
 	}
+	sem := make(chan struct{}, conc)
 
-	barcodeMap := make(map[string]*BarcodeInfo)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	tempDir, err := os.MkdirTemp("", "pdf_images")
+	tempDir, err := os.MkdirTemp("", "pdfimg")
 	if err != nil {
-		fyne.CurrentApp().SendNotification(&fyne.Notification{
-			Title:   "Ошибка директории",
-			Content: fmt.Sprintf("Не удалось создать временную директорию: %v", err),
-		})
-		statusLabel.SetText(fmt.Sprintf("Ошибка: %v", err))
+		runOnUI(func() { statusLabel.SetText(fmt.Sprintf("tmp dir: %v", err)) })
 		return
 	}
 	defer os.RemoveAll(tempDir)
 
-	semaphore := make(chan struct{}, maxConcurrent) // Используем переданный maxConcurrent
-	processedPages := 0
+	codeMap := make(map[string]*BarcodeInfo)
+	var mu sync.Mutex
+	var processed int64
 
-	// Обновление прогресса на главной горутине Fyne.
+	// прогресс‑бар в отдельной горутине, обновление через UI‑поток
 	go func() {
-		for {
-			select {
-			case <-time.After(100 * time.Millisecond):
-				currentProgress := float64(processedPages) / float64(numPages)
-				progressBar.SetValue(currentProgress)
-				statusLabel.SetText(fmt.Sprintf("Обработано %d из %d страниц...", processedPages, numPages))
-				if processedPages >= numPages {
-					return
-				}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			cur := atomic.LoadInt64(&processed)
+			runOnUI(func() {
+				progressBar.SetValue(float64(cur) / float64(numPages))
+				statusLabel.SetText(fmt.Sprintf("Обработано %d из %d страниц...", cur, numPages))
+			})
+			if cur >= int64(numPages) {
+				return
 			}
 		}
 	}()
 
-	for pageNum := 1; pageNum <= numPages; pageNum++ {
+	var wg sync.WaitGroup
+	for p := 1; p <= numPages; p++ {
 		wg.Add(1)
-		go func(pn int) {
+		go func(page int) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-			log.Printf("Processing page %d...", pn)
-
-			outputFilePattern := filepath.Join(tempDir, fmt.Sprintf("page-%d.png", pn))
-
-			gsExecutable := "gs"
+			imgPath := filepath.Join(tempDir, fmt.Sprintf("page-%d.png", page))
+			gs := "gs"
 			if runtime.GOOS == "windows" {
-				gsExecutable = "gswin64c.exe"
+				gs = "gswin64c.exe"
 			}
-
-			// Проверим, доступен ли Ghostscript в PATH
-			gsPath, err := exec.LookPath(gsExecutable)
+			exe, err := exec.LookPath(gs)
 			if err != nil {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Ghostscript не найден",
-					Content: fmt.Sprintf("Программа %s не найдена в PATH. Установите Ghostscript и проверьте переменные среды.", gsExecutable),
-				})
-				statusLabel.SetText(fmt.Sprintf("Ошибка: %s не найден. Установите Ghostscript.", gsExecutable))
-				scanButton.Enable()
+				log.Printf("Ghostscript: %v", err)
 				return
 			}
-
-			cmdArgs := []string{
-				"-dNOPAUSE",
-				"-dBATCH",
-				"-sDEVICE=png16m",
-				fmt.Sprintf("-r%d", dpi),
-				fmt.Sprintf("-dFirstPage=%d", pn),
-				fmt.Sprintf("-dLastPage=%d", pn),
-				fmt.Sprintf("-sOutputFile=%s", outputFilePattern),
-				pdfPath,
-			}
-
-			imageFilename := outputFilePattern
-
-			var gsSuccess = false
-			for attempt := 1; attempt <= 3; attempt++ {
-				cmd := exec.Command(gsPath, cmdArgs...)
-				var stdoutBuf, stderrBuf bytes.Buffer
-				cmd.Stdout = &stdoutBuf
-				cmd.Stderr = &stderrBuf
-
-				log.Printf("Running Ghostscript command for page %d (Attempt %d): %s %v", pn, attempt, cmd.Path, cmd.Args)
-
-				cmdErr := cmd.Run()
-
-				if cmdErr != nil {
-					log.Printf("Attempt %d failed for page %d: %v\nStdout: %s\nStderr: %s",
-						attempt, pn, cmdErr, stdoutBuf.String(), stderrBuf.String())
-					break
+			args := []string{"-dNOPAUSE", "-dBATCH", "-sDEVICE=pnggray", fmt.Sprintf("-r%d", dpi), fmt.Sprintf("-dFirstPage=%d", page), fmt.Sprintf("-dLastPage=%d", page), fmt.Sprintf("-sOutputFile=%s", imgPath), pdfPath}
+			for i := 0; i < 3; i++ {
+				if err = exec.Command(exe, args...).Run(); err == nil {
+					if _, err2 := os.Stat(imgPath); err2 == nil {
+						break
+					}
 				}
-
-				time.Sleep(delay)
-
-				if _, statErr := os.Stat(imageFilename); !os.IsNotExist(statErr) {
-					gsSuccess = true
-					break
-				}
-				log.Printf("Retry %d: Image file for page %d (%s) not found after Ghostscript execution. Stdout: %s, Stderr: %s",
-					attempt, pn, imageFilename, stdoutBuf.String(), stderrBuf.String())
+				time.Sleep(400 * time.Millisecond)
 			}
-
-			if !gsSuccess {
-				log.Printf("ERROR: Image file for page %d (%s) does NOT exist after all retries. Skipping page.", pn, imageFilename)
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Ошибка конвертации",
-					Content: fmt.Sprintf("Не удалось конвертировать страницу %d. Файл не создан.", pn),
-				})
-				return
-			}
-
-			imgFile, err := os.Open(imageFilename)
+			imgFile, err := os.Open(imgPath)
 			if err != nil {
-				log.Printf("Error opening generated image file for page %d (%s): %v.", pn, imageFilename, err)
 				return
 			}
 			defer imgFile.Close()
-
 			img, _, err := image.Decode(imgFile)
 			if err != nil {
-				log.Printf("Error decoding image for page %d: %v. This might indicate a corrupt image or unreadable barcode.", pn, err)
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Ошибка декодирования",
-					Content: fmt.Sprintf("Не удалось декодировать изображение страницы %d.", pn),
-				})
 				return
 			}
-
-			barcodes, err := scanBarcodes([]image.Image{img}, formatsToScan)
-			if err != nil {
-				log.Printf("Error scanning barcodes on page %d: %v", pn, err)
-				return
-			}
+			codes, _ := scanBarcodes([]image.Image{img}, fmts)
 
 			mu.Lock()
-			for _, barcode := range barcodes {
-				if info, exists := barcodeMap[barcode]; exists {
-					info.Pages = append(info.Pages, pn)
+			for _, c := range codes {
+				key := sanitize(c)
+				if bi, ok := codeMap[key]; ok {
+					bi.Pages = append(bi.Pages, page)
 				} else {
-					barcodeMap[barcode] = &BarcodeInfo{Pages: []int{pn}}
+					codeMap[key] = &BarcodeInfo{Pages: []int{page}}
 				}
 			}
 			mu.Unlock()
-
-			processedPages++
-
-		}(pageNum)
+			atomic.AddInt64(&processed, 1)
+			time.Sleep(delay)
+		}(p)
 	}
-
 	wg.Wait()
 
-	output := bytes.NewBufferString("Результаты сканирования штрихкодов:\n")
-	foundDuplicates := false
-	for barcode, info := range barcodeMap {
-		if len(info.Pages) > 1 {
-			fmt.Fprintf(output, "Дубликат штрихкода: %s (найден на страницах: %v)\n", barcode, info.Pages)
-			foundDuplicates = true
-		} else {
-			fmt.Fprintf(output, "Уникальный штрихкод: %s (страница: %d)\n", barcode, info.Pages[0])
+	var buf bytes.Buffer
+	buf.WriteString("Результаты:\n")
+	dup := false
+	for k, v := range codeMap {
+		if len(v.Pages) > 1 {
+			dup = true
+			fmt.Fprintf(&buf, "Дубликат %s на стр. %v\n", k, v.Pages)
 		}
 	}
-
-	if !foundDuplicates {
-		output.WriteString("Дубликаты штрихкодов не найдены.\n")
+	if !dup {
+		buf.WriteString("Дубликатов не найдено.\n")
 	}
-	log.Println("Barcode scan completed.")
 
-	resultsEntry.SetText(output.String())
-	statusLabel.SetText("Сканирование завершено.")
-	progressBar.SetValue(1.0) // Ensure progress bar is full
+	runOnUI(func() {
+		resultsEntry.SetText(buf.String())
+		duration := time.Since(startTime)
+		statusLabel.SetText(fmt.Sprintf("Готово за %v", duration.Truncate(time.Millisecond)))
+		progressBar.SetValue(1)
+	})
 }
 
-// scanBarcodes сканирует штрихкоды на предоставленных изображениях, используя указанные форматы.
-func scanBarcodes(images []image.Image, formats []gozxing.BarcodeFormat) ([]string, error) {
-	var barcodes []string
+// ───────────────────────── barcodes ──────────────────────────
 
-	reader := multi.NewGenericMultipleBarcodeReader(multi.NewMultiFormatReader())
-
-	hints := make(map[gozxing.DecodeHintType]interface{})
-	if len(formats) > 0 {
-		hints[gozxing.DecodeHintType_POSSIBLE_FORMATS] = formats
+func scanBarcodes(imgs []image.Image, fmts []gozxing.BarcodeFormat) ([]string, error) {
+	rdr := multi.NewGenericMultipleBarcodeReader(multi.NewMultiFormatReader())
+	hints := map[gozxing.DecodeHintType]interface{}{gozxing.DecodeHintType_TRY_HARDER: true}
+	if len(fmts) > 0 {
+		hints[gozxing.DecodeHintType_POSSIBLE_FORMATS] = fmts
 	}
-
-	for _, img := range images {
+	var out []string
+	for _, img := range imgs {
 		bmp, err := gozxing.NewBinaryBitmapFromImage(img)
 		if err != nil {
-			log.Printf("Error creating bitmap from image: %v", err)
 			continue
 		}
-
-		results, err := reader.DecodeMultiple(bmp, hints)
+		res, err := rdr.DecodeMultiple(bmp, hints)
 		if err != nil {
 			continue
 		}
-
-		for _, result := range results {
-			barcodes = append(barcodes, result.GetText())
+		for _, r := range res {
+			out = append(out, r.GetText())
 		}
 	}
-
-	return barcodes, nil
+	return out, nil
 }
