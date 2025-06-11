@@ -1,4 +1,4 @@
-# PDF Barcode Scanner
+# PDF duplicate code Scanner
 
 Приложение для сканирования штрихкодов на страницах PDF-документов с графическим интерфейсом.
 
